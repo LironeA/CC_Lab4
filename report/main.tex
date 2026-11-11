@@ -1,0 +1,83 @@
+\documentclass[14pt]{extarticle}
+\usepackage{knu-fcc-style}
+\usepackage{booktabs}
+
+\begin{document}
+
+\KNUTitlePageMake[
+  type={Звіт до лабораторної роботи №4},
+  specialty={122 Комп'ютерні науки},
+  title={Обробка відео на GPU із CUDA},
+  studentInfo={Виконав студент}, student={Божевський Іван},
+  studentSignature={false}, supervisorSignature={false}, year={2026}
+]
+
+\KNUUnnumberedSection{Реферат}
+У роботі реалізовано конвеєр обробки відео засобами OpenCV і CUDA. Відеофайл декодується послідовно, поточний та попередній кадри передаються до пам'яті GPU, для них обчислюється абсолютна попарна різниця, а результат записується до нового MP4-файлу. Програма не має CPU fallback і потребує OpenCV, скомпільованого з підтримкою CUDA.
+
+\KNUKeywords{CUDA, GPU, OPENCV, ОБРОБКА ВІДЕО, ПОПАРНА РІЗНИЦЯ КАДРІВ}
+\KNUContents
+
+\KNUUnnumberedSection{Вступ}
+Метою роботи є реалізація обробки відео на графічному процесорі. Завдання включає відкриття відеофайлу за допомогою OpenCV, завантаження кадрів у пам'ять GPU, обчислення попарної різниці кадрів та збереження результуючого відео засобами OpenCV. Така операція є базою для виявлення руху, фоновіднімання та попередньої обробки відеопотоку.
+
+\section{Теоретичні відомості та алгоритм}
+Нехай $I_t(x,y,c)$ --- значення каналу $c$ пікселя з координатами $(x,y)$ у кадрі $t$. Результат попарної різниці визначається незалежно для кожного пікселя й каналу:
+\begin{equation}
+  D_t(x,y,c)=\left|I_t(x,y,c)-I_{t-1}(x,y,c)\right|, \qquad t\geq1.
+\end{equation}
+Для першого кадру $D_0$ записується чорним, оскільки попереднього кадру немає. Операція має часову складність $O(W\cdot H\cdot C)$ на кадр, але її пікселі не залежать один від одного, тому вона природно відображається на GPU.
+
+CUDA --- платформа NVIDIA для виконання паралельних обчислень на GPU. У OpenCV клас \texttt{cv::cuda::GpuMat} представляє матрицю в пам'яті GPU. Метод \texttt{upload()} копіює декодований \texttt{cv::Mat} з оперативної пам'яті на пристрій, \texttt{cv::cuda::absdiff()} виконує різницю на GPU, а \texttt{download()} повертає результат у \texttt{cv::Mat} для \texttt{cv::VideoWriter}. Декодування й кодування лишаються в OpenCV на CPU, тому вимірюваний час повного конвеєра також містить передавання даних CPU--GPU.
+
+\section{Реалізація програми}
+Програму реалізовано мовою C++17 у файлі \texttt{src/cuda\_video\_difference.cpp}. CMake знаходить модулі OpenCV \texttt{core}, \texttt{videoio}, \texttt{imgproc} та \texttt{cudaarithm}; відсутність CUDA-модуля є помилкою конфігурації, а не непомітним переходом на CPU.
+
+Алгоритм має такі етапи:
+\begin{enumerate}
+  \item \texttt{cv::VideoCapture} відкриває вхідний MP4 і зчитує його параметри: ширину, висоту та частоту кадрів.
+  \item Перший кадр завантажується в \texttt{previous\_gpu}; до результуючого відео записується чорний кадр такого самого розміру.
+  \item Для кожного наступного кадру він завантажується у \texttt{current\_gpu}; виклик \texttt{cv::cuda::absdiff(current\_gpu, previous\_gpu, difference\_gpu)} виконує обчислення на GPU.
+  \item \texttt{difference\_gpu.download()} повертає різницю в RAM, після чого \texttt{cv::VideoWriter} кодує її кодеком \texttt{mp4v}. Поточний кадр стає попереднім для наступної ітерації.
+\end{enumerate}
+
+Перед початком обробки програма перевіряє число пристроїв методом \texttt{getCudaEnabledDeviceCount} модуля \texttt{cv::cuda}. За відсутності CUDA-пристрою або CUDA-збірки OpenCV вона завершується з пояснювальним повідомленням і не видає CPU-результат за GPU-обробку.
+
+\section{Вхідні дані та середовище}
+Використано файл \texttt{16756162\_1280\_720\_25fps.mp4} розміром 7\,016\,820 байт, що містить 291 кадр роздільністю 1280$\times$720 із частотою 25 кадрів/с. Локальна машина має NVIDIA GeForce RTX 4070 та драйвер версії 621.01. Для запуску встановлено CUDA Toolkit~13.5 і OpenCV~4.14, зібраний vcpkg з модулями \texttt{cudaarithm} та FFmpeg. Звичайний пакет \texttt{opencv-python} із PyPI не застосовується, оскільки він не містить CUDA-модулів.
+
+\section{Методика запуску та результати}
+Програму збирають командами \texttt{cmake -S . -B build} і \texttt{cmake --build build}, після чого запускають із двома аргументами: шляхом до вхідного та вихідного MP4. Перед відкриттям відео виконується перевірка наявності CUDA-пристрою. Якщо OpenCV не має CUDA-підтримки або GPU недоступний, програма завершується з помилкою; реалізація не виконує обчислення різниці на CPU.
+
+Під час одного локального запуску на RTX~4070 створено результуюче відео розміром 3\,409\,817 байт. Виміряний час повного конвеєра становить 1.447~с; він включає запуск програми, декодування, копіювання CPU--GPU, CUDA-обчислення, повернення кадру в RAM і кодування MP4. Пропускна здатність становить $291/1.447=201.106$ кадрів/с.
+
+\begin{table}[htbp]
+\caption{Результат локального GPU-запуску}
+\centering
+\begin{tabular}{ll}
+\toprule
+Параметр & Значення \\
+\midrule
+GPU & NVIDIA GeForce RTX 4070 \\
+CUDA Toolkit & 13.5 \\
+OpenCV & 4.14 з \texttt{cudaarithm} \\
+Кадрів & 291 \\
+Час повного конвеєра & 1.447 с \\
+Пропускна здатність & 201.106 FPS \\
+Вихідний файл & \texttt{frame\_difference.mp4} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Різницевий кадр містить світлі області лише там, де значення пікселів змінилися між двома послідовними кадрами. Статичні ділянки наближаються до чорного, а рухомі об'єкти та зміни освітлення стають помітними.
+
+\KNUUnnumberedSection{Висновки}
+Реалізовано програму CUDA/OpenCV для попарної різниці послідовних кадрів відео. Вона відкриває MP4 через \texttt{VideoCapture}, передає кадри у \texttt{cv::cuda::GpuMat}, обчислює \texttt{cv::cuda::absdiff} на GPU та записує результат через \texttt{VideoWriter}. CPU fallback навмисно відсутній: за відсутності CUDA-пристрою або CUDA-збірки OpenCV програма завершується з помилкою. На NVIDIA GeForce RTX 4070 оброблено 291 кадр 1280$\times$720 за 1.447~с, тобто з пропускною здатністю 201.106 FPS; створено результатний файл \texttt{frame\_difference.mp4}.
+
+\begin{thebibliography}{9}
+\bibitem{opencv-cuda} OpenCV Documentation. CUDA-accelerated Computer Vision. \url{https://docs.opencv.org/4.x/d2/dbc/cuda\_intro.html}.
+\bibitem{opencv-videoio} OpenCV Documentation. Video I/O module. \url{https://docs.opencv.org/4.x/dd/de7/group\_videoio.html}.
+\bibitem{cuda} NVIDIA. CUDA C++ Programming Guide. \url{https://docs.nvidia.com/cuda/cuda-c-programming-guide/}.
+\end{thebibliography}
+
+\end{document}
