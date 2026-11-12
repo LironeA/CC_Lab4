@@ -3,16 +3,38 @@
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/videoio.hpp>
 
-#include <filesystem>
 #include <exception>
+#include <filesystem>
 #include <iostream>
+#include <thread>
+#include <vector>
+
+struct FramePair {
+    cv::Mat previous;
+    cv::Mat current;
+    cv::Mat difference;
+};
+
+void process_on_gpu(int device, int devices, std::vector<FramePair>& frames) {
+    cv::cuda::setDevice(device);
+    cv::cuda::GpuMat previous_gpu, current_gpu, difference_gpu;
+
+    for (std::size_t i = device; i < frames.size(); i += devices) {
+        previous_gpu.upload(frames[i].previous);
+        current_gpu.upload(frames[i].current);
+        cv::cuda::absdiff(current_gpu, previous_gpu, difference_gpu);
+        difference_gpu.download(frames[i].difference);
+    }
+}
 
 int run(int argc, char** argv) {
     if (argc != 3) {
         std::cerr << "Usage: " << argv[0] << " input.mp4 output.mp4\n";
         return 1;
     }
-    if (cv::cuda::getCudaEnabledDeviceCount() <= 0) {
+
+    const int devices = cv::cuda::getCudaEnabledDeviceCount();
+    if (devices <= 0) {
         std::cerr << "CUDA-enabled OpenCV and an NVIDIA GPU are required.\n";
         return 1;
     }
@@ -30,29 +52,34 @@ int run(int argc, char** argv) {
     }
 
     const cv::Size size = previous.size();
-    const double fps = input.get(cv::CAP_PROP_FPS);
-    std::filesystem::path output_path(argv[2]);
-    if (output_path.has_parent_path()) std::filesystem::create_directories(output_path.parent_path());
-    cv::VideoWriter output(argv[2], cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps, size);
+    cv::VideoWriter output(argv[2], cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                           input.get(cv::CAP_PROP_FPS), size);
     if (!output.isOpened()) {
         std::cerr << "Cannot create output video.\n";
         return 1;
     }
 
-    cv::cuda::GpuMat previous_gpu, current_gpu, difference_gpu;
-    previous_gpu.upload(previous);
     output.write(cv::Mat::zeros(size, previous.type()));
+    constexpr int pairs_per_gpu = 4;
+    while (true) {
+        std::vector<FramePair> frames;
+        for (int i = 0; i < devices * pairs_per_gpu; ++i) {
+            cv::Mat current;
+            if (!input.read(current)) break;
+            frames.push_back({previous, current, {}});
+            previous = current;
+        }
+        if (frames.empty()) break;
 
-    cv::Mat current, difference;
-    while (input.read(current)) {
-        current_gpu.upload(current);
-        cv::cuda::absdiff(current_gpu, previous_gpu, difference_gpu);
-        difference_gpu.download(difference);
-        output.write(difference);
-        current_gpu.copyTo(previous_gpu);
+        std::vector<std::thread> workers;
+        for (int device = 0; device < devices; ++device) {
+            workers.emplace_back(process_on_gpu, device, devices, std::ref(frames));
+        }
+        for (auto& worker : workers) worker.join();
+        for (const auto& frame : frames) output.write(frame.difference);
     }
 
-    std::cout << "Done: " << argv[2] << '\n';
+    std::cout << "Done with " << devices << " GPU(s): " << argv[2] << '\n';
     return 0;
 }
 
